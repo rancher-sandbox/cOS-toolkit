@@ -104,9 +104,71 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 	})
 
 	Describe("in a not initiated environment", func() {
-		// Probe and InitBtrfsPartition methods are just borrowed from the btrfs
-		// backend hence those are not nested here as this would be the same exact
-		// test as in btrfs-backend.go
+		It("probes a non initiated environment, missing subvolumes", func() {
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			stat, err := backend.Probe(statePart.Path, statePart.MountPoint)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stat.ActiveID).To(Equal(0))
+			Expect(len(runner.GetCmds())).To(Equal(0))
+			runner.ClearCmds()
+		})
+
+		It("initalizes the btrfs partition", func() {
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			Expect(backend.InitBrfsPartition(rootDir)).To(Succeed())
+			Expect(runner.MatchMilestones([][]string{
+				{"btrfs", "quota", "enable"},
+				{"btrfs", "subvolume", "create"},
+				{"btrfs", "qgroup", "create"},
+				{"/usr/lib/snapper/installation-helper", "--root-prefix"},
+			})).To(Succeed())
+		})
+
+		It("partition initialization fails enabling quota", func() {
+			errMsg := "btrfs quota failed"
+			sEffects = append(sEffects, &sideEffect{cmd: "btrfs quota enable", errorMsg: errMsg})
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			Expect(backend.InitBrfsPartition(rootDir)).NotTo(Succeed())
+			Expect(runner.MatchMilestones([][]string{
+				{"btrfs", "quota", "enable"},
+			})).To(Succeed())
+		})
+
+		It("partition initialization fails creating subvolume", func() {
+			errMsg := "subvolume create failed"
+			sEffects = append(sEffects, &sideEffect{cmd: "btrfs subvolume create", errorMsg: errMsg})
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			Expect(backend.InitBrfsPartition(rootDir)).NotTo(Succeed())
+			Expect(runner.MatchMilestones([][]string{
+				{"btrfs", "quota", "enable"},
+				{"btrfs", "subvolume", "create"},
+			})).To(Succeed())
+		})
+
+		It("partition initialization fails setting quota group", func() {
+			errMsg := "qgroup create failed"
+			sEffects = append(sEffects, &sideEffect{cmd: "btrfs qgroup create", errorMsg: errMsg})
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			Expect(backend.InitBrfsPartition(rootDir)).NotTo(Succeed())
+			Expect(runner.MatchMilestones([][]string{
+				{"btrfs", "quota", "enable"},
+				{"btrfs", "subvolume", "create"},
+				{"btrfs", "qgroup", "create"},
+			})).To(Succeed())
+		})
+
+		It("partition initialization fails running snapper's installation helper", func() {
+			errMsg := "/usr/lib/snapper/installation-helper failed"
+			sEffects = append(sEffects, &sideEffect{cmd: "/usr/lib/snapper/installation-helper --root-prefix", errorMsg: errMsg})
+			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
+			Expect(backend.InitBrfsPartition(rootDir)).NotTo(Succeed())
+			Expect(runner.MatchMilestones([][]string{
+				{"btrfs", "quota", "enable"},
+				{"btrfs", "subvolume", "create"},
+				{"btrfs", "qgroup", "create"},
+				{"/usr/lib/snapper/installation-helper", "--root-prefix"},
+			})).To(Succeed())
+		})
 
 		Describe("snapshot created", func() {
 			var err error
@@ -119,8 +181,9 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 					snap, err = backend.CreateNewSnapshot(rootDir, 0)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(snap.ID).To(Equal(1))
+
 					Expect(runner.MatchMilestones([][]string{
-						{"btrfs", "subvolume", "create"},
+						{"/usr/lib/snapper/installation-helper"},
 					})).To(Succeed())
 				})
 			})
@@ -134,18 +197,10 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				snapperCfg := filepath.Join(snap.Path, "/etc/snapper/configs")
 				Expect(utils.MkdirAll(fs, snapperCfg, constants.DirPerm)).To(Succeed())
 
-				cmdOut := "ID 259 gen 13454 top level 258 path @/.snapshots/1/snapshot\n"
-				listCmd := "btrfs subvolume list"
-
-				sEffects = append(sEffects, &sideEffect{cmd: listCmd, cmdOut: cmdOut})
-
 				err = backend.CommitSnapshot(rootDir, snap)
 				Expect(err).To(Succeed())
-
 				Expect(runner.MatchMilestones([][]string{
-					{"btrfs", "property", "set"},
-					{"btrfs", "subvolume", "list"},
-					{"btrfs", "subvolume", "set-default", "259"},
+					{"snapper", "--no-dbus", "--root", rootDir, "modify", "--read-only", "--default"},
 				})).To(Succeed())
 			})
 		})
@@ -175,27 +230,20 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 	})
 
 	Describe("initiated environment while not being in active nor passive", func() {
-		var defaultVol, volumesList, listCmd, getDefCmd string
-		var volSideEffect *sideEffect
+		var listCmd, snapsList string
+		var snapsSideEffect *sideEffect
 		BeforeEach(func() {
-			defaultVol = "ID 259 gen 13453 top level 258 path @/.snapshots/1/snapshot\n"
-			volumesList = "ID 257 gen 13451 top level 3 path @\n"
-			volumesList += "ID 258 gen 13452 top level 257 path @/.snapshots\n"
-			volumesList += defaultVol
+			listCmd = "snapper --no-dbus --root /some/root --csvout list"
+			snapsList = "1,yes,no\n"
+			snapsSideEffect = &sideEffect{cmd: listCmd, cmdOut: snapsList}
+			sEffects = append(sEffects, snapsSideEffect)
 
-			listCmd = "btrfs subvolume list"
-			getDefCmd = "btrfs subvolume get-default"
-
-			volSideEffect = &sideEffect{cmd: listCmd, cmdOut: volumesList}
-			sEffects = append(sEffects, volSideEffect)
+			Expect(utils.MkdirAll(fs, filepath.Join(statePart.MountPoint, ".snapshots"), constants.DirPerm)).To(Succeed())
 		})
 
 		Describe("initated backend", func() {
 			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
-			var defVolSideEffect *sideEffect
 			BeforeEach(func() {
-				defVolSideEffect = &sideEffect{cmd: getDefCmd, cmdOut: defaultVol}
-				sEffects = append(sEffects, defVolSideEffect)
 				By("probes an initiatied environment", func() {
 					backend = snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
 					stat, err := backend.Probe(statePart.Path, statePart.MountPoint)
@@ -206,7 +254,6 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 					Expect(stat.StateMount).To(Equal(statePart.MountPoint))
 					Expect(runner.MatchMilestones([][]string{
 						strings.Fields(listCmd),
-						strings.Fields(getDefCmd),
 					})).To(Succeed())
 				})
 				// Clear commands history
@@ -331,24 +378,15 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 	})
 
 	Describe("initiated environment while being in active or passive", func() {
-		var defaultVol, volumesList, listCmd, getDefCmd, fMntCmd string
-		var listSideEffect *sideEffect
+		var listCmd, snapsList, fMntCmd string
+		var snapsSideEffect *sideEffect
 		BeforeEach(func() {
-			defaultVol = "ID 261 gen 13455 top level 260 path @/.snapshots/3/snapshot\n"
-			volumesList = "ID 257 gen 13451 top level 3 path @\n"
-			volumesList += "ID 258 gen 13452 top level 257 path @/.snapshots\n"
-			volumesList += "ID 259 gen 13453 top level 258 path @/.snapshots/1/snapshot\n"
-			volumesList += "ID 260 gen 13454 top level 259 path @/.snapshots/2/snapshot\n"
-			volumesList += defaultVol
+			listCmd = "snapper --no-dbus --root /some/root --csvout list"
+			snapsList = "1,no,no\n2,no,yes\n3,yes,no\n"
+			snapsSideEffect = &sideEffect{cmd: listCmd, cmdOut: snapsList}
+			sEffects = append(sEffects, snapsSideEffect)
 
-			listCmd = "btrfs subvolume list"
-			getDefCmd = "btrfs subvolume get-default"
 			fMntCmd = "findmnt"
-
-			listSideEffect = &sideEffect{cmd: listCmd, cmdOut: volumesList}
-
-			sEffects = append(sEffects, listSideEffect)
-			sEffects = append(sEffects, &sideEffect{cmd: getDefCmd, cmdOut: defaultVol})
 
 			// Set active mode
 			Expect(utils.MkdirAll(fs, constants.RunElementalDir, constants.DirPerm)).To(Succeed())
@@ -371,9 +409,8 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 					Expect(stat.RootDir).To(Equal("/some/root"))
 					Expect(stat.StateMount).To(Equal("/some/root/run/initramfs/elemental-state"))
 					Expect(runner.MatchMilestones([][]string{
-						strings.Fields(listCmd),
-						strings.Fields(getDefCmd),
 						strings.Fields(fMntCmd),
+						strings.Fields(listCmd),
 					})).To(Succeed())
 					runner.ClearCmds()
 				})

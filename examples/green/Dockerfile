@@ -13,6 +13,9 @@ ARG VERSION
 ENV REPO=${REPO}
 ENV VERSION=${VERSION}
 
+# Add bleeding edge repo for snapper
+RUN zypper ar https://download.opensuse.org/repositories/home:/aschnell:/snapper/openSUSE_Tumbleweed/home:aschnell:snapper.repo
+
 # Install kernel, systemd, dracut, grub2 and other required tools
 RUN ARCH=$(uname -m); \
     if [[ "${ARCH}" != "riscv64" ]]; then \

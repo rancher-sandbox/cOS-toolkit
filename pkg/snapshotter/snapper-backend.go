@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/rancher/elemental-toolkit/v2/pkg/constants"
+	"github.com/rancher/elemental-toolkit/v2/pkg/elemental"
 	"github.com/rancher/elemental-toolkit/v2/pkg/types"
 	"github.com/rancher/elemental-toolkit/v2/pkg/utils"
 )
@@ -33,6 +34,7 @@ const (
 	snapperRootConfig    = "/etc/snapper/configs/root"
 	snapperSysconfig     = "/etc/sysconfig/snapper"
 	snapperDefaultconfig = "/etc/default/snapper"
+	snapperInstaller     = "/usr/lib/snapper/installation-helper"
 )
 
 var _ subvolumeBackend = (*snapperBackend)(nil)
@@ -49,60 +51,136 @@ type snapperBackend struct {
 func newSnapperBackend(cfg *types.Config, maxSnapshots int) *snapperBackend {
 	// snapper backend embeds an instance of a btrfs backend to fill the gap for the
 	// operatons that snapper can't entirely handle.
-	return &snapperBackend{cfg: cfg, maxSnapshots: maxSnapshots, btrfs: newBtrfsBackend(cfg, maxSnapshots)}
+
+	// TODO detect wheather the current snapper supports the required installation helper
+	return &snapperBackend{cfg: cfg, maxSnapshots: maxSnapshots, btrfs: nil}
 }
 
 // Probe tests the given device and returns the found state as a backendStat struct
-func (s *snapperBackend) Probe(device, mountpoint string) (backendStat, error) {
-	stat, err := s.btrfs.Probe(device, mountpoint)
-	if err != nil {
-		return stat, err
+func (s *snapperBackend) Probe(device, mountpoint string) (stat backendStat, retErr error) {
+	snapshots := filepath.Join(mountpoint, snapshotsPath)
+	// On active or passive we must ensure the actual mountpoint reported by the state
+	// partition is the actual root, ghw only reports a single mountpoint per device...
+	if elemental.IsPassiveMode(*s.cfg) || elemental.IsActiveMode(*s.cfg) {
+		rootDir, stateMount, currentID, err := findStateMount(s.cfg.Runner, device)
+		if err != nil {
+			return stat, err
+		}
+
+		sl, err := s.ListSnapshots(rootDir)
+		if err != nil {
+			return stat, err
+		}
+
+		stat.RootDir = rootDir
+		stat.StateMount = stateMount
+		stat.CurrentID = currentID
+		stat.ActiveID = sl.ActiveID
+		s.activeID, s.currentID = stat.ActiveID, stat.CurrentID
+		return stat, nil
+	} else if ok, _ := utils.Exists(s.cfg.Fs, snapshots); ok {
+		// We must mount .snapshots to ensure snapper is capable to list snapshots
+		if ok, _ := s.cfg.Mounter.IsLikelyNotMountPoint(snapshots); ok {
+			err := s.cfg.Mounter.Mount(device, snapshots, "btrfs", []string{"ro", fmt.Sprintf("subvol=%s", filepath.Join(rootSubvol, snapshotsPath))})
+			if err != nil {
+				return stat, err
+			}
+			defer func() {
+				err = s.cfg.Mounter.Unmount(snapshots)
+				if err != nil && retErr == nil {
+					retErr = err
+				}
+			}()
+		}
+		sl, err := s.ListSnapshots(mountpoint)
+		if err != nil {
+			return stat, err
+		}
+		stat.ActiveID = sl.ActiveID
 	}
+
+	stat.RootDir = mountpoint
+	stat.StateMount = mountpoint
 	s.activeID, s.currentID = stat.ActiveID, stat.CurrentID
 	return stat, nil
 }
 
 // InitBrfsPartition is the method required to create snapshots structure on just formated partition
 func (s *snapperBackend) InitBrfsPartition(rootDir string) error {
-	// Snapper does not support initiating a just formated btrfs partition
-	return s.btrfs.InitBrfsPartition(rootDir)
+	if s.btrfs != nil {
+		return s.btrfs.InitBrfsPartition(rootDir)
+	}
+
+	// create root subvolume
+	err := initBtrfsQuotaAndRootSubvolume(s.cfg.Runner, s.cfg.Logger, rootDir)
+	if err != nil {
+		s.cfg.Logger.Errorf("failed setting quota and root subvolume")
+		return err
+	}
+
+	// create required snapshots subvolumes
+	out, err := s.cfg.Runner.Run(snapperInstaller, "--root-prefix", filepath.Join(rootDir, rootSubvol), "--step", "filesystem")
+	if err != nil {
+		s.cfg.Logger.Errorf("failed initiating btrfs subvolumes to work with snapper: %s", strings.TrimSpace(string(out)))
+	}
+	return err
 }
 
 // CreateNewSnapshot creates a new snapshot based on the given baseID. In case basedID == 0, this method
 // assumes it will be creating the first snapshot.
 func (s snapperBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snapshot, error) {
+	var newID int
+	var err error
+	var cmdOut []byte
+	var workingDir, path string
+
 	if baseID == 0 {
-		// Snapper does not support creating the very first empty snapshot yet
-		return s.btrfs.CreateNewSnapshot(rootDir, baseID)
+		if s.btrfs != nil {
+			// Snapper does not support creating the very first empty snapshot yet
+			return s.btrfs.CreateNewSnapshot(rootDir, baseID)
+		}
+		newID = 1
+		cmdOut, err = s.cfg.Runner.Run(
+			snapperInstaller, "--root-prefix", rootDir, "--step",
+			"config", "--description", fmt.Sprintf("first root filesystem, snapshot %d", newID),
+			"--userdata", fmt.Sprintf("%s=yes", updateProgress),
+		)
+		if err != nil {
+			s.cfg.Logger.Errorf("failed creating initial snapshot: %s", strings.TrimSpace(string(cmdOut)))
+			return nil, err
+		}
+		path = filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, newID))
+		workingDir = path
+	} else {
+		s.cfg.Logger.Infof("Creating a new snapshot from %d", baseID)
+		args := []string{
+			"create", "--from", strconv.Itoa(baseID),
+			"--read-write", "--print-number", "--description",
+			fmt.Sprintf("Update based on snapshot %d", baseID),
+			"-c", "number", "--userdata", fmt.Sprintf("%s=yes", updateProgress),
+		}
+		args = append(s.rootArgs(rootDir), args...)
+		cmdOut, err = s.cfg.Runner.Run("snapper", args...)
+		if err != nil {
+			s.cfg.Logger.Errorf("snapper failed to create a new snapshot: %v", err)
+			return nil, err
+		}
+		newID, err = strconv.Atoi(strings.TrimSpace(string(cmdOut)))
+		if err != nil {
+			s.cfg.Logger.Errorf("failed parsing new snapshot ID")
+			return nil, err
+		}
+
+		path = filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, newID))
+		workingDir = filepath.Join(rootDir, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
+		err = utils.MkdirAll(s.cfg.Fs, workingDir, constants.DirPerm)
+		if err != nil {
+			s.cfg.Logger.Errorf("failed creating the snapshot working directory: %v", err)
+			_ = s.DeleteSnapshot(rootDir, newID)
+			return nil, err
+		}
 	}
 
-	s.cfg.Logger.Infof("Creating a new snapshot from %d", baseID)
-	args := []string{
-		"create", "--from", strconv.Itoa(baseID),
-		"--read-write", "--print-number", "--description",
-		fmt.Sprintf("Update for snapshot %d", baseID),
-		"-c", "number", "--userdata", fmt.Sprintf("%s=yes", updateProgress),
-	}
-	args = append(s.rootArgs(rootDir), args...)
-	cmdOut, err := s.cfg.Runner.Run("snapper", args...)
-	if err != nil {
-		s.cfg.Logger.Errorf("snapper failed to create a new snapshot: %v", err)
-		return nil, err
-	}
-	newID, err := strconv.Atoi(strings.TrimSpace(string(cmdOut)))
-	if err != nil {
-		s.cfg.Logger.Errorf("failed parsing new snapshot ID")
-		return nil, err
-	}
-
-	workingDir := filepath.Join(rootDir, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
-	err = utils.MkdirAll(s.cfg.Fs, workingDir, constants.DirPerm)
-	if err != nil {
-		s.cfg.Logger.Errorf("failed creating the snapshot working directory: %v", err)
-		_ = s.DeleteSnapshot(rootDir, newID)
-		return nil, err
-	}
-	path := filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, newID))
 	return &types.Snapshot{
 		ID:      newID,
 		WorkDir: workingDir,
@@ -118,11 +196,6 @@ func (s snapperBackend) CommitSnapshot(rootDir string, snapshot *types.Snapshot)
 		return err
 	}
 
-	if s.activeID == 0 && s.currentID == 0 {
-		// Snapper does not support modifying a snapshot from a host not having a configured snapper
-		// and this is the case for the installation media
-		return s.btrfs.CommitSnapshot(rootDir, snapshot)
-	}
 	args := []string{
 		"modify", "--read-only", "--default", "--userdata",
 		fmt.Sprintf("%s=,%s=", installProgress, updateProgress), strconv.Itoa(snapshot.ID),
@@ -137,7 +210,7 @@ func (s snapperBackend) CommitSnapshot(rootDir string, snapshot *types.Snapshot)
 }
 
 // ListSnapshots list the available snapshots in the state filesystem
-func (s snapperBackend) ListSnapshots(rootDir string) (snapshotsList, error) {
+func (s *snapperBackend) ListSnapshots(rootDir string) (snapshotsList, error) {
 	var sl snapshotsList
 	ids := []int{}
 	re := regexp.MustCompile(`^(\d+),(yes|no),(yes|no)$`)
@@ -176,8 +249,8 @@ func (s snapperBackend) ListSnapshots(rootDir string) (snapshotsList, error) {
 // DeleteSnapshot deletes the given snapshot
 func (s snapperBackend) DeleteSnapshot(rootDir string, id int) error {
 	if s.activeID == 0 && s.currentID == 0 {
-		// With snapper is not possible to delete any snapshot without an active one
-		return s.btrfs.DeleteSnapshot(rootDir, id)
+		s.cfg.Logger.Warnf("cannot delete snapshot %d without a current and active snapshot defined, nothing to do", id)
+		return nil
 	}
 	args := []string{"delete", "--sync", strconv.Itoa(id)}
 	args = append(s.rootArgs(rootDir), args...)

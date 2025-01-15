@@ -139,7 +139,7 @@ func (b *btrfsBackend) Probe(device string, mountpoint string) (backendStat, err
 	// On active or passive we must ensure the actual mountpoint reported by the state
 	// partition is the actual root, ghw only reports a single mountpoint per device...
 	if elemental.IsPassiveMode(*b.cfg) || elemental.IsActiveMode(*b.cfg) {
-		rootDir, stateMount, currentID, err := b.findStateMount(device)
+		rootDir, stateMount, currentID, err := findStateMount(b.cfg.Runner, device)
 		if err != nil {
 			return stat, err
 		}
@@ -158,27 +158,17 @@ func (b *btrfsBackend) Probe(device string, mountpoint string) (backendStat, err
 
 // InitBrfsPartition is the method required to create snapshots structure on just formated partition
 func (b *btrfsBackend) InitBrfsPartition(rootDir string) error {
-	b.cfg.Logger.Debug("Enabling btrfs quota")
-	cmdOut, err := b.cfg.Runner.Run("btrfs", "quota", "enable", rootDir)
+	err := initBtrfsQuotaAndRootSubvolume(b.cfg.Runner, b.cfg.Logger, rootDir)
 	if err != nil {
-		b.cfg.Logger.Errorf("failed setting quota for btrfs partition at %s: %s", rootDir, string(cmdOut))
+		b.cfg.Logger.Errorf("failed setting quota and root subvolume")
 		return err
 	}
 
-	b.cfg.Logger.Debug("Creating essential subvolumes")
-	for _, subvolume := range []string{filepath.Join(rootDir, rootSubvol), filepath.Join(rootDir, rootSubvol, snapshotsPath)} {
-		b.cfg.Logger.Debugf("Creating subvolume: %s", subvolume)
-		cmdOut, err = b.cfg.Runner.Run("btrfs", "subvolume", "create", subvolume)
-		if err != nil {
-			b.cfg.Logger.Errorf("failed creating subvolume %s: %s", subvolume, string(cmdOut))
-			return err
-		}
-	}
-
-	b.cfg.Logger.Debug("Create btrfs quota group")
-	cmdOut, err = b.cfg.Runner.Run("btrfs", "qgroup", "create", "1/0", rootDir)
+	subvolume := filepath.Join(rootDir, rootSubvol, snapshotsPath)
+	b.cfg.Logger.Debugf("Creating subvolume: %s", subvolume)
+	cmdOut, err := b.cfg.Runner.Run("btrfs", "subvolume", "create", subvolume)
 	if err != nil {
-		b.cfg.Logger.Errorf("failed creating quota group for %s: %s", rootDir, string(cmdOut))
+		b.cfg.Logger.Errorf("failed creating subvolume %s: %s", subvolume, string(cmdOut))
 		return err
 	}
 
@@ -189,6 +179,7 @@ func (b *btrfsBackend) InitBrfsPartition(rootDir string) error {
 // assumes it will be creating the first snapshot.
 func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snapshot, error) {
 	var workingDir string
+	var desc string
 
 	newID, err := b.computeNewID(rootDir)
 	if err != nil {
@@ -213,6 +204,7 @@ func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snap
 			return nil, err
 		}
 		workingDir = path
+		desc = fmt.Sprintf("first root filesystem, snapshot %d", newID)
 	} else {
 		b.cfg.Logger.Debugf("Creating snapshot %d", newID)
 		cmdOut, err := b.cfg.Runner.Run(
@@ -231,9 +223,10 @@ func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snap
 			_ = b.DeleteSnapshot(rootDir, newID)
 			return nil, err
 		}
+		desc = fmt.Sprintf("Update based on snapshot %d", baseID)
 	}
 	snapperXML := filepath.Join(rootDir, fmt.Sprintf(snapshotInfoPath, newID))
-	err = b.writeSnapperSnapshotXML(snapperXML, newSnapperSnapshotXML(newID, "first root filesystem"))
+	err = b.writeSnapperSnapshotXML(snapperXML, newSnapperSnapshotXML(newID, desc))
 	if err != nil {
 		b.cfg.Logger.Errorf("failed creating snapper info XML")
 		return nil, err
@@ -520,44 +513,4 @@ func (b btrfsBackend) computeNewID(rootDir string) (int, error) {
 		return 0, fmt.Errorf("no snapshots found, inconsistent state")
 	}
 	return slices.Max(list.IDs) + 1, nil
-}
-
-// findStateMount returns, from the given device, the mount point of the top subvolume (@),
-// the mount point of the current snapshot and current snapshot ID. Elemental hardware
-// utilities only return a single mountpoint per partition without having a reliable criteria
-// on which one returns ('@', '.snapshots', '.snapshots/<ID>/snapshot', ...)
-func (b btrfsBackend) findStateMount(device string) (rootDir string, stateMount string, snapshotID int, err error) {
-	output, err := b.cfg.Runner.Run("findmnt", "-lno", "SOURCE,TARGET", device)
-	if err != nil {
-		return "", "", 0, err
-	}
-	r := regexp.MustCompile(snapshotPathRegex)
-
-	scanner := bufio.NewScanner(strings.NewReader(strings.TrimSpace(string(output))))
-	for scanner.Scan() {
-		lineFields := strings.Fields(scanner.Text())
-		if len(lineFields) != 2 {
-			continue
-		}
-
-		subStart := strings.Index(lineFields[0], "[/")
-		subEnd := strings.LastIndex(lineFields[0], "]")
-
-		if subStart != -1 && subEnd != -1 {
-			subVolume := lineFields[0][subStart+2 : subEnd]
-
-			if subVolume == rootSubvol {
-				stateMount = lineFields[1]
-			} else if match := r.FindStringSubmatch(subVolume); match != nil {
-				rootDir = lineFields[1]
-				snapshotID, _ = strconv.Atoi(match[1])
-			}
-		}
-	}
-
-	if stateMount == "" || rootDir == "" {
-		err = fmt.Errorf("could not find expected mountpoints, findmnt output: %s", string(output))
-	}
-
-	return rootDir, stateMount, snapshotID, err
 }

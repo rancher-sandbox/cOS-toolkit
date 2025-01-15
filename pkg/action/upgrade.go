@@ -136,6 +136,8 @@ func (u *UpgradeAction) upgradeInstallStateYaml() error {
 	var oldActiveID int
 	var deletedIDs []int
 
+	u.cfg.Logger.Infof("Upgrading install state")
+
 	if u.spec.Partitions.Recovery == nil || u.spec.Partitions.State == nil {
 		return fmt.Errorf("undefined state or recovery partition")
 	}
