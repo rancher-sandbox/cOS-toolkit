@@ -25,7 +25,7 @@ require (
 	github.com/spf13/viper v1.19.0
 	golang.org/x/crypto v0.32.0
 	gopkg.in/yaml.v3 v3.0.1
-	k8s.io/mount-utils v0.32.0
+	k8s.io/mount-utils v0.32.1
 )
 
 require (
